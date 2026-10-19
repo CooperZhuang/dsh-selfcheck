@@ -40,15 +40,23 @@ function resolveProfile() {
 }
 const PROFILE = resolveProfile();
 
-/** 桌面客户端的 app.asar 候选位置。 */
-function asarCandidates() {
+/** 桌面客户端的安装候选：asar 形态（包在 asar 里）与目录形态（app/node_modules 是真目录）。 */
+function appCandidates() {
   const out = [];
-  if (process.env.DSH_ASAR) out.push(process.env.DSH_ASAR);
+  if (process.env.DSH_ASAR) out.push({ kind: 'asar', path: process.env.DSH_ASAR });
   const local = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
-  out.push(path.join(local, 'Programs', 'DeepSeek Harness', 'resources', 'app.asar'));
-  out.push('/Applications/DSH Desktop Beta.app/Contents/Resources/app.asar');
-  out.push('/Applications/DeepSeek Harness.app/Contents/Resources/app.asar');
-  return out.filter((p) => fs.existsSync(p));
+  const apps = [
+    path.join(local, 'Programs', 'DeepSeek Harness', 'resources'),
+    '/Applications/DSH Desktop Beta.app/Contents/Resources',
+    '/Applications/DeepSeek Harness.app/Contents/Resources',
+  ];
+  for (const res of apps) {
+    const asar = path.join(res, 'app.asar');
+    if (fs.existsSync(asar)) out.push({ kind: 'asar', path: asar });
+    const dir = path.join(res, 'app', 'node_modules', '@deepseek-ai');
+    if (fs.existsSync(dir)) out.push({ kind: 'dir', path: dir });
+  }
+  return out;
 }
 
 /**
@@ -154,29 +162,37 @@ function hostFromAsar(asar) {
   };
 }
 
+/** npx 缓存根：Windows 在 %LOCALAPPDATA%\npm-cache\_npx，macOS/Linux 在 ~/.npm/_npx。 */
+function npxRoots() {
+  const roots = [];
+  if (process.env.LOCALAPPDATA) roots.push(path.join(process.env.LOCALAPPDATA, 'npm-cache', '_npx'));
+  if (process.env.npm_config_cache) roots.push(path.join(process.env.npm_config_cache, '_npx'));
+  roots.push(path.join(os.homedir(), '.npm', '_npx'));
+  return roots.filter((r) => fs.existsSync(r));
+}
+
 /** 找当前运行的 DSH 安装目录：npx 最近一次写入 .package-lock.json 的那个。 */
 function resolveInstall() {
   const explicit = process.argv[2] ?? process.env.DSH_INSTALL_DIR;
   if (explicit) return explicit;
-  const npxRoot = path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local'), 'npm-cache', '_npx');
-  const candidates = fs.readdirSync(npxRoot, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => {
+  const candidates = [];
+  for (const npxRoot of npxRoots()) {
+    for (const e of fs.readdirSync(npxRoot, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
       const dir = path.join(npxRoot, e.name, 'node_modules', NS, 'dsh');
-      if (!fs.existsSync(path.join(dir, 'package.json'))) return null;
+      if (!fs.existsSync(path.join(dir, 'package.json'))) continue;
       let at = 0;
       try { at = fs.statSync(path.join(npxRoot, e.name, 'node_modules', '.package-lock.json')).mtimeMs; } catch {}
-      return { dir, at };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.at - a.at);
-  if (!candidates.length) throw new Error(`no DSH install found under ${npxRoot}`);
-  return candidates[0].dir;
+      candidates.push({ dir, at });
+    }
+  }
+  candidates.sort((a, b) => b.at - a.at);
+  // 找不到 CLI 安装不是错误：桌面客户端场景下宿主就是 app.asar
+  return candidates[0]?.dir ?? null;
 }
 
 const INSTALL = resolveInstall();
-const SCOPE_DIR = path.dirname(INSTALL);          // …/node_modules/@deepseek-ai
-const version = JSON.parse(fs.readFileSync(path.join(INSTALL, 'package.json'), 'utf8')).version;
+const SCOPE_DIR = INSTALL ? path.dirname(INSTALL) : undefined;  // …/node_modules/@deepseek-ai
 
 /**
  * 选宿主视图：目录式里能拿到 primitives 就用目录式；否则退回 asar
@@ -184,15 +200,31 @@ const version = JSON.parse(fs.readFileSync(path.join(INSTALL, 'package.json'), '
  */
 let host;
 let asarHandle = null;
-if (fs.existsSync(path.join(SCOPE_DIR, 'dsh-client-ui-primitives'))) {
+if (INSTALL && fs.existsSync(path.join(SCOPE_DIR, 'dsh-client-ui-primitives'))) {
   host = hostFromDir(SCOPE_DIR);
 } else {
-  const asarPath = asarCandidates()[0];
-  if (!asarPath) throw new Error('no host package scope: neither a directory install nor an app.asar was found');
-  asarHandle = openAsar(asarPath);
-  host = hostFromAsar(asarHandle);
+  // 可能同时装着多个应用（Mac 上有 DSH Desktop Beta 与 DeepSeek Harness），
+  // 选内核包最多的那个 —— 客户端半边依赖的 primitives 只在完整的那份里。
+  let best = null;
+  for (const c of appCandidates()) {
+    let view = null;
+    let handle = null;
+    try {
+      if (c.kind === 'dir') view = hostFromDir(c.path);
+      else { handle = openAsar(c.path); view = hostFromAsar(handle); }
+    } catch { continue; }
+    const size = view.packages().size;
+    if (!best || size > best.size) { best?.handle?.close(); best = { handle, view, size }; }
+    else handle?.close();
+  }
+  if (!best) throw new Error('no host package scope: neither a directory install nor an app.asar was found');
+  asarHandle = best.handle;
+  host = best.view;
 }
-console.log(`DSH install : ${INSTALL}\nDSH version : ${version}\nhost        : ${host.kind === 'dir' ? SCOPE_DIR : `asar ${host.asarPath} (${host.prefix})`}\nprofile     : ${PROFILE}\n`);
+const version = INSTALL
+  ? JSON.parse(fs.readFileSync(path.join(INSTALL, 'package.json'), 'utf8')).version
+  : (host.packageJson('dsh')?.version ?? 'unknown');
+console.log(`DSH install : ${INSTALL}\nDSH version : ${version}\nhost        : ${host.kind === 'dir' ? host.scopeDir : `asar ${host.asarPath} (${host.prefix})`}\nprofile     : ${PROFILE}\n`);
 
 // --- 1. profile 组合 ---
 let compositionOk = true;
@@ -206,8 +238,9 @@ try {
   for (const w of (analysis.summary?.warnings ?? []).slice(0, 6)) console.log('    warn: ' + w);
   if ((analysis.summary?.warnings ?? []).length > 6) console.log(`    …另有 ${analysis.summary.warnings.length - 6} 条 warning`);
 } catch (error) {
-  compositionOk = false;
-  console.log(`[1] analyzeProfile 不可用：${error.message}`);
+  const noMarket = /dshmarket/.test(error.message) || /Cannot find module/.test(error.message);
+  if (noMarket) console.log('[1] profile 里没有 dshmarket —— 跳过 loader 组合检查');
+  else { compositionOk = false; console.log(`[1] analyzeProfile 不可用：${error.message}`); }
 }
 
 // --- 宿主导出表 ---
